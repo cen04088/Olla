@@ -1,5 +1,9 @@
+import gzip
+import json
+import logging
 import math
 import struct
+import sys
 from functools import lru_cache
 
 from django.conf import settings
@@ -9,9 +13,21 @@ from .mountain_zip_api import fetch_mountain_zip_trails
 from .vworld_api import route_length_km
 
 
+logger = logging.getLogger(__name__)
+
 ROAD_DIR = settings.BASE_DIR.parent / "road" / "WG_MT_WAY"
 ROAD_SHP_PATH = ROAD_DIR / "WG_MT_WAY.shp"
 ROAD_DBF_PATH = ROAD_DIR / "WG_MT_WAY.dbf"
+
+# SHP(약 150MB)를 미리 가공해 둔 경량 캐시. `python manage.py build_road_trails_cache`로 생성한다.
+ROAD_CACHE_PATH = settings.BASE_DIR.parent / "data" / "road_trails.json.gz"
+ROAD_CACHE_VERSION = 1
+ROAD_CACHE_FIELDS = [
+    "id", "mountain", "name", "difficulty", "distance_km", "duration_min",
+    "elevation_gain_m", "lat", "lng", "highlights", "road_risk", "route_polyline",
+]
+ROAD_REGION = "브이월드 등산로 로컬 SHP"
+ROAD_SOURCE = "road/WG_MT_WAY.shp"
 
 
 def fetch_local_road_trails(lat=None, lng=None, mountain_name="", radius_km=8, size=30):
@@ -53,23 +69,168 @@ def fetch_local_road_trails(lat=None, lng=None, mountain_name="", radius_km=8, s
         "ok": True,
         "source": "forest_mountain_zip+local_road_shp" if archive_items else "local_road_shp",
         "total_count": len(items),
-        "items": items[: int(size)],
+        "items": [with_route_geometry(item) for item in items[: int(size)]],
     }
 
 
-@lru_cache(maxsize=1)
 def load_local_road_trails():
-    if not ROAD_SHP_PATH.exists() or not ROAD_DBF_PATH.exists():
-        return []
+    """로컬 등산로 목록. 메모리 절약을 위해 route_geometry는 빠져 있다.
 
+    좌표가 필요하면 with_route_geometry(course)로 해당 코스만 복원한다.
+    """
+    return _road_store()[0]
+
+
+def has_road_route(course):
+    return bool(course.get("id")) and course["id"] in _road_store()[1]
+
+
+def with_route_geometry(course):
+    """로컬 등산로 코스에 route_geometry를 붙인 사본을 돌려준다. 원본(캐시)은 건드리지 않는다."""
+    if course.get("route_geometry"):
+        return course
+    encoded = _road_store()[1].get(course.get("id"))
+    if not encoded:
+        return course
+    return {**course, "route_geometry": decode_polyline(encoded)}
+
+
+@lru_cache(maxsize=1)
+def _road_store():
+    """(코스 목록, {코스 id: 인코딩된 경로}) — 워커당 한 번만 만든다."""
+    rows = read_road_cache()
+    if rows is None:
+        if not ROAD_SHP_PATH.exists() or not ROAD_DBF_PATH.exists():
+            return [], {}
+        logger.warning(
+            "%s 이(가) 없어 SHP를 직접 읽습니다(수십 초, 1GB 이상 메모리 사용). "
+            "`python manage.py build_road_trails_cache`로 캐시를 만들어 두세요.",
+            ROAD_CACHE_PATH,
+        )
+        rows = build_road_cache_rows()
+
+    courses = []
+    routes = {}
+    intern = sys.intern
+    for (course_id, mountain, name, difficulty, distance_km, duration_min,
+         elevation_gain_m, lat, lng, highlights, road_risk, route_polyline) in rows:
+        courses.append({
+            "id": course_id,
+            "mountain": intern(mountain),
+            "name": intern(name),
+            "region": ROAD_REGION,
+            "difficulty": intern(difficulty),
+            "distance_km": distance_km,
+            "duration_min": duration_min,
+            "elevation_gain_m": elevation_gain_m,
+            "lat": lat,
+            "lng": lng,
+            "crowding": 0.28,
+            "highlights": [intern(text) for text in highlights],
+            "source": ROAD_SOURCE,
+            "road_risk": intern(road_risk),
+        })
+        routes[course_id] = route_polyline
+    return courses, routes
+
+
+def read_road_cache(path=None):
+    path = path or ROAD_CACHE_PATH
+    if not path.exists():
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+    except (OSError, ValueError) as exc:
+        logger.warning("등산로 캐시를 읽지 못했습니다(%s): %s", path, exc)
+        return None
+    if payload.get("version") != ROAD_CACHE_VERSION or payload.get("fields") != ROAD_CACHE_FIELDS:
+        logger.warning("등산로 캐시 형식이 맞지 않습니다(%s). 캐시를 다시 생성하세요.", path)
+        return None
+    return payload.get("trails") or []
+
+
+def build_road_cache_rows():
+    """SHP·DBF를 파싱해 캐시 한 줄씩(ROAD_CACHE_FIELDS 순서)의 리스트로 만든다."""
     rows = read_dbf_records(ROAD_DBF_PATH)
     shapes = read_polyline_shapes(ROAD_SHP_PATH)
-    courses = []
+    cache_rows = []
     for index, (row, shape) in enumerate(zip(rows, shapes), start=1):
         course = normalize_road_record(index, row, shape)
         if course:
-            courses.append(course)
-    return courses
+            cache_rows.append([
+                course["id"],
+                course["mountain"],
+                course["name"],
+                course["difficulty"],
+                course["distance_km"],
+                course["duration_min"],
+                course["elevation_gain_m"],
+                round(course["lat"], 6),
+                round(course["lng"], 6),
+                course["highlights"],
+                course["road_risk"],
+                encode_polyline(course["route_geometry"]),
+            ])
+    return cache_rows
+
+
+def write_road_cache(rows, path=None):
+    path = path or ROAD_CACHE_PATH
+    payload = {
+        "version": ROAD_CACHE_VERSION,
+        "source": ROAD_SOURCE,
+        "fields": ROAD_CACHE_FIELDS,
+        "trails": rows,
+    }
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as raw_file:
+        # mtime=0: 같은 입력이면 같은 파일이 나오도록(불필요한 git 변경 방지)
+        with gzip.GzipFile(fileobj=raw_file, mode="wb", compresslevel=9, mtime=0) as cache_file:
+            cache_file.write(body)
+    return path
+
+
+def encode_polyline(points, precision=5):
+    """[{lat, lng}, ...] → Google Encoded Polyline 문자열 (1e-5도 ≈ 1.1m 정밀도)."""
+    factor = 10 ** precision
+    chunks = []
+    prev_lat = prev_lng = 0
+    for point in points:
+        lat = round(point["lat"] * factor)
+        lng = round(point["lng"] * factor)
+        for delta in (lat - prev_lat, lng - prev_lng):
+            value = ~(delta << 1) if delta < 0 else delta << 1
+            while value >= 0x20:
+                chunks.append(chr((0x20 | (value & 0x1F)) + 63))
+                value >>= 5
+            chunks.append(chr(value + 63))
+        prev_lat, prev_lng = lat, lng
+    return "".join(chunks)
+
+
+def decode_polyline(encoded, precision=5):
+    factor = 10 ** precision
+    points = []
+    index = lat = lng = 0
+    length = len(encoded)
+    while index < length:
+        deltas = []
+        for _ in range(2):
+            shift = result = 0
+            while True:
+                byte = ord(encoded[index]) - 63
+                index += 1
+                result |= (byte & 0x1F) << shift
+                shift += 5
+                if byte < 0x20:
+                    break
+            deltas.append(~(result >> 1) if result & 1 else result >> 1)
+        lat += deltas[0]
+        lng += deltas[1]
+        points.append({"lat": lat / factor, "lng": lng / factor})
+    return points
 
 
 def normalize_road_record(index, row, points):

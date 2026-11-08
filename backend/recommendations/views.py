@@ -1,8 +1,10 @@
 import json
 import re
+from functools import lru_cache
 
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.gzip import gzip_page
 from django.views.decorators.http import require_GET, require_POST
 
 from .landslide_api import fetch_landslide_prediction
@@ -36,9 +38,26 @@ def health(request):
     )
 
 
+# 프론트(산 목록·탐방로 목록)에 필요한 필드만 내려준다. 경로 좌표(route_geometry)를 포함하면 응답이 30MB를 넘는다.
+COURSE_SUMMARY_FIELDS = (
+    "id", "mountain", "name", "region", "difficulty", "distance_km", "duration_min",
+    "elevation_gain_m", "lat", "lng", "has_entrance_start",
+)
+
+
+@lru_cache(maxsize=1)
+def _course_summaries_json():
+    summaries = [
+        {field: course[field] for field in COURSE_SUMMARY_FIELDS if field in course}
+        for course in load_public_trail_courses()
+    ]
+    return json.dumps({"courses": summaries}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 @require_GET
+@gzip_page
 def courses(request):
-    return JsonResponse({"courses": load_public_trail_courses()})
+    return HttpResponse(_course_summaries_json(), content_type="application/json; charset=utf-8")
 
 
 @require_GET
@@ -269,6 +288,7 @@ def landslide(request):
 
 
 @require_GET
+@gzip_page
 def mountains(request):
     return JsonResponse({"mountains": _get_mountains()}, json_dumps_params={"ensure_ascii": False})
 
@@ -713,7 +733,7 @@ def _cached_weather(lat, lng, mountain=""):
 def ml_risk_view(request):
     """지정 시각 및 날씨 기반 소방청 사고 ML 위험 예측 (위험 지수 보정 및 24시간 추이 반환)."""
     import datetime
-    from .accident_model import predict_accident_risk
+    from .accident_model import predict_accident_risk, predict_hourly_risk_indexes
 
     # 1. 날짜 및 시간 파라미터 파싱
     date_str = request.GET.get("date")
@@ -799,20 +819,15 @@ def ml_risk_view(request):
         w_msg = f"기상 악화 요인({', '.join(w_reasons) if w_reasons else '비/바람'}) 반영으로 위험도가 크게 상승했습니다."
         result["warning"] = w_msg + " " + result.get("warning", "")
 
-    # 5. 24시간 추이 계산 (날씨 보정 일괄 적용)
-    hourly_risks = []
-    for h in range(24):
-        h_res = predict_accident_risk(
-            month=month, hour=h, weekday=weekday,
-            temp=temp, rain=rain, wind=wind, humidity=humidity
-        )
-        h_base = h_res["risk_index"]
-        h_adjusted = round(min(1.0, h_base + weather_penalty * 0.50), 3)
-        hourly_risks.append({
-            "hour": h,
-            "risk_index": h_adjusted
-        })
-    result["hourly_risks"] = hourly_risks
+    # 5. 24시간 추이 계산 (날씨 보정 일괄 적용) — 24개 시간대를 한 번에 예측
+    hourly_base = predict_hourly_risk_indexes(
+        month=month, weekday=weekday,
+        temp=temp, rain=rain, wind=wind, humidity=humidity
+    )
+    result["hourly_risks"] = [
+        {"hour": h, "risk_index": round(min(1.0, h_base + weather_penalty * 0.50), 3)}
+        for h, h_base in enumerate(hourly_base)
+    ]
 
     return JsonResponse(result, json_dumps_params={"ensure_ascii": False})
 

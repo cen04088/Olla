@@ -15,6 +15,10 @@ node_modules
 
 backend/db.sqlite3
 *.sqlite3
+
+# 등산로 원본 SHP(202MB)는 서버에서 쓰지 않음 → data/road_trails.json.gz 사용
+# (SHP가 바뀌면 로컬에서 `python manage.py build_road_trails_cache` 실행 후 커밋)
+road/
 *.log
 __pycache__
 *.pyc

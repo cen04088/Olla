@@ -110,6 +110,21 @@ else:
         }
     }
 
+# 캐시: 기본 LocMemCache는 gunicorn 워커마다 따로라 날씨·LLM 브리핑을 워커 수만큼 중복 호출한다.
+# 배포 환경에서는 같은 컨테이너의 워커들이 공유하는 파일 캐시를 쓴다. (DJANGO_CACHE_DIR로 경로 지정 가능)
+_CACHE_DIR = os.environ.get("DJANGO_CACHE_DIR", "").strip()
+if not _CACHE_DIR and (_DATABASE_URL or os.environ.get("RAILWAY_PUBLIC_DOMAIN")):
+    import tempfile
+    _CACHE_DIR = os.path.join(tempfile.gettempdir(), "forestrx-cache")
+if _CACHE_DIR:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+            "LOCATION": _CACHE_DIR,
+            "OPTIONS": {"MAX_ENTRIES": 5000},
+        }
+    }
+
 LANGUAGE_CODE = "ko-kr"
 TIME_ZONE = "Asia/Seoul"
 USE_I18N = True

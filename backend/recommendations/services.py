@@ -8,7 +8,7 @@ from django.core.cache import cache
 
 from .disaster_risk import disaster_risk_level, disaster_risk_messages, find_course_disaster_risks
 from .loaders import load_public_trail_courses, load_disaster_risk_zones
-from .local_road_api import fetch_local_road_trails
+from .local_road_api import fetch_local_road_trails, has_road_route, with_route_geometry
 from .weather_api import fetch_current_weather
 from .vworld_api import fetch_vworld_trails
 
@@ -211,7 +211,8 @@ def safety_decision_for_course(course, profile, weather, w_score, diff_fit, time
             "risk_factors": red_flags + yellow_flags[:2],
         }
 
-    if len(yellow_flags) >= 2 or w_score < 75 or diff_fit < 0.40:
+    # 재난위험지구 '주의'는 경고 문구가 1개뿐이어도 추천 단계에서 묻히지 않게 '주의'로 판정한다
+    if len(yellow_flags) >= 2 or w_score < 75 or diff_fit < 0.40 or disaster_level == "caution":
         return {
             "safety_decision": "caution",
             "safety_label": "주의",
@@ -261,7 +262,8 @@ def recommend_courses(payload):
     max_km = max(int(profile.get("maxDistanceKm", 50)), 10)
 
     mountain_name = (profile.get("mountainName") or "").strip()
-    courses = [dict(c) for c in load_public_trail_courses()]
+    # 캐시된 코스 목록은 읽기만 한다(점수 계산 루프에서 코스별 새 dict를 만듦) → 8천여 개 전체 복사 불필요
+    courses = load_public_trail_courses()
 
     query_lat, query_lng = user_lat, user_lng
     weather_lat, weather_lng = user_lat, user_lng
@@ -305,29 +307,29 @@ def recommend_courses(payload):
             + courses
         )
 
-    route_courses = [c for c in courses if c.get("route_geometry")]
+    # 로컬 등산로는 메모리 절약을 위해 좌표 없이 캐시돼 있다 → 경로 보유 여부만 확인하고 좌표는 최종 결과에만 붙인다
+    route_courses = [c for c in courses if c.get("route_geometry") or has_road_route(c)]
     if route_courses:
         courses = route_courses
 
     w = compute_weights(profile)
     HIGH_RISK_KW = {"추락", "낙석", "급경사", "붕괴", "고립"}
     recommendations = []
+    # 출발·일몰 시각은 모든 코스에 공통이므로 한 번만 계산한다
+    window = departure_window(weather, profile.get("departureDate"), profile.get("departureTime"))
 
     for course in courses:
         quality = _data_quality_multiplier(course)
         if quality < 0.55:
             continue
 
-        course["disaster_risk_zones"] = find_course_disaster_risks(course, all_disaster_zones)
+        # 원본 코스(워커 캐시)는 건드리지 않고, 요청마다 새 dict 하나만 만든다
+        item = {**course, "disaster_risk_zones": _course_disaster_zones(course, all_disaster_zones)}
 
         diff_fit = _difficulty_fit(course, profile)
         time_f = _time_fit(course, profile)
         access_f, distance = _access_fit(course, user_lat, user_lng, max_km)
-        daylight_margin = daylight_margin_minutes(
-            course, weather,
-            departure_date=profile.get("departureDate"),
-            departure_time=profile.get("departureTime"),
-        )
+        daylight_margin = _margin_in_window(course, window)
         day_f = _daylight_fit(daylight_margin)
 
         # 5개 요소 가중 합산 → 0.0~1.0
@@ -342,22 +344,25 @@ def recommend_courses(payload):
         # 데이터 품질 보정
         raw *= quality
 
-        # 재난위험지구 감점 (최대 -0.15)
-        zones = course.get("disaster_risk_zones") or []
+        # 재난위험지구 감점 (최대 -0.15). 같은 산이라는 것만 확인된 위험지구(area)는 '주의' 수준으로만 감점한다.
+        zones = item["disaster_risk_zones"]
         if zones:
-            high = sum(1 for z in zones if any(kw in (z.get("risk_factor") or "") for kw in HIGH_RISK_KW))
+            high = sum(
+                1 for z in zones
+                if z.get("match_scope") != "area" and any(kw in (z.get("risk_factor") or "") for kw in HIGH_RISK_KW)
+            )
             caution_z = len(zones) - high
             raw -= min(high * 0.06 + caution_z * 0.02, 0.15)
 
         total = round(min(max(raw, 0.0), 1.0) * 100, 1)
 
         safety = safety_decision_for_course(
-            course, profile, weather, w_score, diff_fit, time_f, daylight_margin
+            item, profile, weather, w_score, diff_fit, time_f, daylight_margin
         )
 
-        recommendations.append({
-            **course,
-            **safety,
+        # reason·agent_briefing·safe_link_preview는 최종 노출 코스에만 만든다(_finalize_recommendation)
+        item.update(safety)
+        item.update({
             "score": total,
             "scores": {
                 "fitness": round(diff_fit * 100, 1),
@@ -369,11 +374,9 @@ def recommend_courses(payload):
             "distance_from_user_km": distance,
             "daylight_margin_min": daylight_margin,
             "safety_grade": safety_grade(w_score),
-            "reason": build_reason(course, profile, w_score, distance, daylight_margin),
-            "agent_briefing": build_agent_briefing(course, safety, daylight_margin, weather),
-            "safe_link_preview": build_safe_link_preview(course, safety),
             "weather": weather,
         })
+        recommendations.append(item)
 
     recommendations.sort(
         key=lambda item: (safety_rank(item["safety_decision"]), item["score"]),
@@ -388,14 +391,29 @@ def recommend_courses(payload):
             if target in str(item.get("mountain", "")).replace(" ", "")
             or target in str(item.get("name", "")).replace(" ", "")
         ]
-        others = [item for item in recommendations if item not in matched]
+        matched_ids = {id(item) for item in matched}
+        others = [item for item in recommendations if id(item) not in matched_ids]
         recommendations = matched + others
 
-    top3 = recommendations[:3]
-    alternatives = select_alternatives(recommendations, top3, profile)
+    top_items = recommendations[:3]
+    alternative_items = select_alternatives(recommendations, top_items, profile)
     no_safe = bool(recommendations) and all(
         item["safety_decision"] == "not_recommended" for item in recommendations[:8]
     )
+
+    # LLM 브리핑은 상위 3개에만(병렬 호출), 대안 코스는 템플릿 문장으로 만든다
+    def _finalize_top(item):
+        return _finalize_recommendation(item, profile, w_score, weather, use_llm=True)
+
+    if len(top_items) > 1:
+        with ThreadPoolExecutor(max_workers=len(top_items)) as pool:
+            top3 = list(pool.map(_finalize_top, top_items))
+    else:
+        top3 = [_finalize_top(item) for item in top_items]
+    alternatives = [
+        _finalize_recommendation(item, profile, w_score, weather, use_llm=False)
+        for item in alternative_items
+    ]
 
     return {
         "result_state": "no_safe_course" if no_safe else "has_recommendations",
@@ -413,13 +431,47 @@ def recommend_courses(payload):
     }
 
 
+def _finalize_recommendation(item, profile, w_score, weather, use_llm):
+    """최종 노출 코스에만 경로 좌표·설명·브리핑을 붙인다."""
+    item = with_route_geometry(item)
+    distance = item.get("distance_from_user_km")
+    daylight_margin = item.get("daylight_margin_min")
+    item["reason"] = build_reason(item, profile, w_score, distance, daylight_margin)
+    item["agent_briefing"] = build_agent_briefing(item, item, daylight_margin, weather, use_llm=use_llm)
+    item["safe_link_preview"] = build_safe_link_preview(item, item)
+    return item
+
+
+# 코스별 재난위험지구 매칭 결과 캐시. 코스·위험지구 데이터 모두 워커 수명 동안 고정이라
+# 요청마다 (코스 수 × 위험지구 수) 문자열 비교를 반복할 필요가 없다.
+_ZONE_MATCH_CACHE = {"zones_ref": None, "matches": {}}
+_ZONE_MATCH_CACHE_LIMIT = 100_000
+
+
+def _course_disaster_zones(course, all_zones):
+    if not all_zones:
+        return []
+    if _ZONE_MATCH_CACHE["zones_ref"] is not all_zones:
+        _ZONE_MATCH_CACHE["zones_ref"] = all_zones
+        _ZONE_MATCH_CACHE["matches"] = {}
+    matches = _ZONE_MATCH_CACHE["matches"]
+    key = (course.get("id"), course.get("mountain"), course.get("name"), course.get("region"))
+    zones = matches.get(key)
+    if zones is None:
+        zones = find_course_disaster_risks(course, all_zones)
+        if len(matches) < _ZONE_MATCH_CACHE_LIMIT:
+            matches[key] = zones
+    return list(zones)
+
+
 # ── 브리핑·설명 빌더 ────────────────────────────────────────────────────────────
 
-def build_agent_briefing(course, safety, daylight_margin=None, weather=None):
-    from .llm_briefing import generate_briefing
-    llm = generate_briefing(course, safety, weather or {}, daylight_margin)
-    if llm:
-        return llm
+def build_agent_briefing(course, safety, daylight_margin=None, weather=None, use_llm=True):
+    if use_llm:
+        from .llm_briefing import generate_briefing
+        llm = generate_briefing(course, safety, weather or {}, daylight_margin)
+        if llm:
+            return llm
     factors = ", ".join(safety["risk_factors"][:2])
     if safety["safety_decision"] == "recommend":
         return f"{course['name']}은 현재 기상과 하산 시간을 고려했을 때 안정적으로 이용 가능한 코스입니다."
@@ -518,6 +570,11 @@ def select_alternatives(recommendations, top_courses, profile=None):
 # ── 일몰 여유 계산 ─────────────────────────────────────────────────────────────
 
 def daylight_margin_minutes(course, weather, now=None, departure_date=None, departure_time=None):
+    return _margin_in_window(course, departure_window(weather, departure_date, departure_time, now))
+
+
+def departure_window(weather, departure_date=None, departure_time=None, now=None):
+    """(출발 시각, 일몰 시각). 일몰 정보가 없으면 None."""
     if not weather or not weather.get("sunset"):
         return None
     current = parse_departure_datetime(departure_date, departure_time, now)
@@ -525,6 +582,13 @@ def daylight_margin_minutes(course, weather, now=None, departure_date=None, depa
     sunset = parse_departure_datetime(departure_date, weather["sunset"], current)
     if not sunset:
         return None
+    return current, sunset
+
+
+def _margin_in_window(course, window):
+    if window is None:
+        return None
+    current, sunset = window
     finish = current + timedelta(minutes=int(course.get("duration_min", 0)))
     return round((sunset - finish).total_seconds() / 60)
 
