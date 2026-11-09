@@ -1,4 +1,5 @@
 import csv
+import logging
 import os
 import re
 from functools import lru_cache
@@ -13,6 +14,8 @@ from .mountain_coordinates import (
     AMBIGUOUS_MOUNTAIN_NAMES,
     find_mountain_coordinates,
 )
+
+logger = logging.getLogger(__name__)
 
 # 산별 실제 혼잡도 기본값 (데이터 기반 없음 → 통계 기반 추정)
 MOUNTAIN_CROWDING = {
@@ -74,10 +77,12 @@ def _is_summit_or_intermediate(text: str) -> bool:
     return any(kw in t for kw in _SUMMIT_KEYWORDS)
 
 
-TRAIL_CSV_PATH = settings.BASE_DIR.parent / "국립공원공단_탐방로_20240911.csv"
-DISASTER_RISK_CSV_PATH = settings.BASE_DIR.parent / "국립공원공단_재난위험지구_20240904.csv"
+DATA_DIR = settings.BASE_DIR.parent / "data"
+# CSV는 data/ 폴더에 있다. (예전엔 저장소 루트를 가리켜 파일을 못 찾고, 재난위험지구가 조용히 0건으로 로드됐음)
+TRAIL_CSV_PATH = DATA_DIR / "국립공원공단_탐방로_20240911.csv"
+DISASTER_RISK_CSV_PATH = DATA_DIR / "국립공원공단_재난위험지구_20240904.csv"
 KEY_FILE_PATH = settings.BASE_DIR.parent / "key.txt"
-DATA_LINK_FILE_PATH = settings.BASE_DIR.parent / "data" / "데이터 링크.txt"
+DATA_LINK_FILE_PATH = DATA_DIR / "데이터 링크.txt"
 VWORLD_KEY_FILE_PATH = settings.BASE_DIR.parent / "vworld_key.txt"
 KMA_API_HUB_KEY_FILE_PATH = settings.BASE_DIR.parent / "kma_api_hub_key.txt"
 
@@ -205,6 +210,7 @@ def load_disaster_risk_zones():
         pass
 
     if not DISASTER_RISK_CSV_PATH.exists():
+        logger.warning("재난위험지구 CSV를 찾을 수 없습니다: %s (재난위험 경고가 꺼진 상태로 동작)", DISASTER_RISK_CSV_PATH)
         return []
 
     for encoding in ("utf-8-sig", "cp949", "euc-kr"):

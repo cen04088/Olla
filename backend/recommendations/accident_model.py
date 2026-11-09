@@ -1,10 +1,13 @@
 from pathlib import Path
+import logging
 import pickle
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
+
+logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 ACCIDENT_DATASET_NAMES = (
@@ -71,13 +74,17 @@ def _accident_category(code: str) -> str:
     return "기타"
 
 
-def _make_features(month: int, hour: int, weekday: int, temp: float = 15.0, rain: float = 0.0, wind: float = 1.5, humidity: float = 50.0) -> np.ndarray:
+def _feature_row(month: int, hour: int, weekday: int, temp: float = 15.0, rain: float = 0.0, wind: float = 1.5, humidity: float = 50.0) -> list:
     is_weekend = int(weekday >= 5)
     time_bin = 0 if hour <= 6 else 1 if hour <= 10 else 2 if hour <= 14 else 3 if hour <= 17 else 4 if hour <= 20 else 5
     season = 0 if month in (3, 4, 5) else 1 if month in (6, 7, 8) else 2 if month in (9, 10, 11) else 3
     if _has_weather_features:
-        return np.array([[month, hour, weekday, is_weekend, time_bin, season, temp, rain, wind, humidity]])
-    return np.array([[month, hour, weekday, is_weekend, time_bin, season]])
+        return [month, hour, weekday, is_weekend, time_bin, season, temp, rain, wind, humidity]
+    return [month, hour, weekday, is_weekend, time_bin, season]
+
+
+def _make_features(month: int, hour: int, weekday: int, temp: float = 15.0, rain: float = 0.0, wind: float = 1.5, humidity: float = 50.0) -> np.ndarray:
+    return np.array([_feature_row(month, hour, weekday, temp, rain, wind, humidity)])
 
 
 def _per_capita_rate(counts: pd.Series, hiker_weights: dict) -> dict:
@@ -241,7 +248,9 @@ def _initialize() -> None:
             _initialized = True
             return
         except Exception:
-            pass
+            # 여기서 실패하면 CSV로 RandomForest 2개를 워커마다 새로 학습한다(수십 초 CPU).
+            # 대개 scikit-learn/numpy 버전이 모델 저장 시점과 달라서 생긴다 → requirements.txt 버전 확인
+            logger.warning("사고 예측 모델(%s) 로드 실패 — CSV로 재학습합니다.", model_path, exc_info=True)
 
     rows = _load_training_rows()
     df = _prepare_training_frame(rows) if not rows.empty else pd.DataFrame()
@@ -304,11 +313,7 @@ def predict_accident_risk(month: int, hour: int, weekday: int, temp: float = 15.
     h_risk = _hourly_per_capita.get(hour, 0.5)
     m_risk = _monthly_per_capita.get(month, 0.5)
     wd_risk = _weekday_per_capita.get(weekday, 0.5)
-    stat_risk = h_risk * 0.50 + m_risk * 0.35 + wd_risk * 0.15
-
-    # RF 중증도 예측을 risk_index에 반영 (최대 +0.20 부스트)
-    rf_boost = sev_proba.get("high", 0) * 0.20 + sev_proba.get("medium", 0) * 0.05
-    risk_index = round(min(1.0, stat_risk + rf_boost), 3)
+    risk_index = _risk_index(hour, month, weekday, sev_proba)
     ml_safety_score = round(1.0 - risk_index, 3)
 
     top_type = max(type_proba, key=type_proba.get)
@@ -341,6 +346,34 @@ def predict_accident_risk(month: int, hour: int, weekday: int, temp: float = 15.
         },
         "training": dict(_training_summary),
     }
+
+
+def _risk_index(hour: int, month: int, weekday: int, sev_proba: dict) -> float:
+    h_risk = _hourly_per_capita.get(hour, 0.5)
+    m_risk = _monthly_per_capita.get(month, 0.5)
+    wd_risk = _weekday_per_capita.get(weekday, 0.5)
+    stat_risk = h_risk * 0.50 + m_risk * 0.35 + wd_risk * 0.15
+    # RF 중증도 예측을 risk_index에 반영 (최대 +0.20 부스트)
+    rf_boost = sev_proba.get("high", 0) * 0.20 + sev_proba.get("medium", 0) * 0.05
+    return round(min(1.0, stat_risk + rf_boost), 3)
+
+
+def predict_hourly_risk_indexes(month: int, weekday: int, temp: float = 15.0, rain: float = 0.0, wind: float = 1.5, humidity: float = 50.0) -> list:
+    """0~23시 risk_index를 한 번의 predict_proba로 계산한다.
+
+    predict_accident_risk(hour=h)["risk_index"]를 24번 부르는 것과 같은 값이다.
+    """
+    _initialize()
+    if not _initialized or _sev_clf is None:
+        return [0.5] * 24
+
+    X = np.array([_feature_row(month, hour, weekday, temp, rain, wind, humidity) for hour in range(24)])
+    rows = _sev_clf.predict_proba(X)
+    classes = list(_sev_clf.classes_)
+    return [
+        _risk_index(hour, month, weekday, dict(zip(classes, rows[hour].tolist())))
+        for hour in range(24)
+    ]
 
 
 def save_accident_model_to_disk() -> bool:

@@ -1,10 +1,16 @@
+import gzip
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from unittest.mock import patch
+
 from django.test import Client, TestCase
 
+from .llm_briefing import _cache_key as briefing_cache_key
+from .rag_retriever import retrieve_trail_context
 from .services import (
+    recommend_courses,
     data_quality_adjustment,
     daylight_margin_minutes,
     purpose_bonus,
@@ -100,6 +106,42 @@ class RecommendationApiTests(TestCase):
         self.assertEqual(len(data["recommendations"]), 3)
         self.assertGreaterEqual(data["recommendations"][0]["score"], data["recommendations"][1]["score"])
         self.assertIn("weather", data)
+
+    def test_llm_briefing_runs_only_for_top_three(self):
+        payload = {"profile": {"departureTime": "09:00"}, "location": {"lat": 37.5665, "lng": 126.978}}
+        with patch("recommendations.llm_briefing.generate_briefing", return_value="LLM 브리핑") as generate:
+            result = recommend_courses(payload)
+
+        self.assertLessEqual(generate.call_count, 3)
+        self.assertEqual(generate.call_count, len(result["recommendations"]))
+        self.assertTrue(all(item["agent_briefing"] == "LLM 브리핑" for item in result["recommendations"]))
+        self.assertTrue(all(item["agent_briefing"] != "LLM 브리핑" for item in result["alternatives"]))
+        self.assertTrue(all(item.get("route_geometry") for item in result["recommendations"]))
+
+    def test_llm_briefing_cache_key_is_per_course(self):
+        safety = {"safety_decision": "recommend", "risk_factors": []}
+        weather = {"rainfall_mm": 0, "wind_speed_ms": 1}
+        key_a = briefing_cache_key({"id": "a", "name": "A코스", "difficulty": "easy"}, safety, weather, 120)
+        key_b = briefing_cache_key({"id": "b", "name": "B코스", "difficulty": "easy"}, safety, weather, 120)
+
+        self.assertNotEqual(key_a, key_b)
+
+    def test_trail_context_prefers_requested_mountain(self):
+        passages = retrieve_trail_context("초보 코스 추천", "북한산")
+
+        self.assertTrue(passages)
+        self.assertIn("북한산", passages[0])
+
+    def test_courses_endpoint_returns_light_summaries(self):
+        response = Client().get("/api/courses/", HTTP_ACCEPT_ENCODING="gzip")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get("Content-Encoding"), "gzip")
+        courses = json.loads(gzip.decompress(response.content))["courses"]
+        self.assertGreater(len(courses), 0)
+        self.assertNotIn("route_geometry", courses[0])
+        for field in ("id", "mountain", "name", "lat", "lng", "difficulty", "distance_km", "duration_min"):
+            self.assertIn(field, courses[0])
 
     def test_recommendations_do_not_mutate_public_course_cache(self):
         client = Client()

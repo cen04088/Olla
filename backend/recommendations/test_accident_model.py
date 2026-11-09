@@ -1,9 +1,21 @@
 from django.test import TestCase
 
-from .accident_model import get_accident_model_training_summary, predict_accident_risk
+from .accident_model import (
+    get_accident_model_training_summary,
+    predict_accident_risk,
+    predict_hourly_risk_indexes,
+)
 
 
 class AccidentModelTests(TestCase):
+    def test_hourly_batch_matches_single_hour_predictions(self):
+        conditions = {"month": 7, "weekday": 2, "temp": 30.0, "rain": 12.5, "wind": 6.0, "humidity": 90.0}
+
+        batched = predict_hourly_risk_indexes(**conditions)
+        one_by_one = [predict_accident_risk(hour=hour, **conditions)["risk_index"] for hour in range(24)]
+
+        self.assertEqual(batched, one_by_one)
+
     def test_training_uses_added_accident_datasets_except_2023_2024(self):
         summary = get_accident_model_training_summary()
 

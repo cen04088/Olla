@@ -13,6 +13,8 @@ def _cache_key(course, safety, weather, daylight_margin):
         "ok"
     )
     key_parts = (
+        # 브리핑 문장에 코스 이름이 들어가므로 코스별로 캐시해야 다른 코스 이름이 섞여 나오지 않는다
+        course.get("id") or course.get("name", ""),
         safety.get("safety_decision", ""),
         course.get("difficulty", ""),
         rainfall_bucket,

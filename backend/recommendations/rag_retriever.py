@@ -4,6 +4,7 @@
 LLM 컨텍스트로 제공합니다.
 """
 import re
+from array import array
 from functools import lru_cache
 
 # ── 정적 지식 베이스 ──────────────────────────────────────────────────────────
@@ -598,7 +599,8 @@ def _tokenize(text: str) -> set:
     return words | bigrams
 
 
-@lru_cache(maxsize=512)
+# 지식베이스(47개) + 산 정보 DB(최대 500개) 문서가 다 들어가도록 여유 있게 잡는다
+@lru_cache(maxsize=1024)
 def _cached_tokenize(text: str) -> frozenset:
     return frozenset(_tokenize(text))
 
@@ -649,30 +651,63 @@ def retrieve_from_knowledge_base(query: str, top_k: int = 3) -> list:
     return [doc for _, doc in scored[:top_k]]
 
 
-def retrieve_trail_context(query: str, mountain_name: str = "", top_k: int = 3) -> list:
-    """국립공원 탐방로 데이터에서 관련 코스 검색."""
+def _course_search_text(course: dict) -> str:
+    return " ".join([
+        course.get("mountain", ""),
+        course.get("name", ""),
+        course.get("region", ""),
+        " ".join(course.get("highlights", []) or []),
+    ])
+
+
+@lru_cache(maxsize=1)
+def _trail_search_index():
+    """탐방로 역색인 (토큰 → 코스 번호들). 워커당 한 번만 만든다.
+
+    예전에는 메시지마다 8천여 개 코스 문장을 전부 다시 토큰화했다.
+    """
     from .loaders import load_public_trail_courses
     courses = load_public_trail_courses()
+    postings: dict = {}
+    by_mountain: dict = {}
+    for index, course in enumerate(courses):
+        for token in _tokenize(_course_search_text(course)):
+            postings.setdefault(token, array("I")).append(index)
+        by_mountain.setdefault(course.get("mountain", ""), array("I")).append(index)
+    return courses, postings, by_mountain
+
+
+def retrieve_trail_context(query: str, mountain_name: str = "", top_k: int = 3) -> list:
+    """국립공원 탐방로 데이터에서 관련 코스 검색."""
+    courses, postings, by_mountain = _trail_search_index()
 
     search_text = f"{query} {mountain_name}".strip()
     query_tokens = _cached_tokenize(search_text)
-    results = []
-    for course in courses:
-        course_text = " ".join([
-            course.get("mountain", ""),
-            course.get("name", ""),
-            course.get("region", ""),
-            " ".join(course.get("highlights", []) or []),
-        ])
-        course_tokens = _cached_tokenize(course_text)
-        score = _weighted_score(query_tokens, course_tokens)
-        # 산 이름 직접 일치 시 강하게 부스팅
-        if mountain_name and mountain_name in course.get("mountain", ""):
-            score += 1.5
-        if score > 0:
-            results.append((score, course))
 
-    results.sort(key=lambda x: x[0], reverse=True)
+    # _weighted_score와 같은 점수: 일치 토큰 IDF 합 / (질문 토큰 수 + 0.5)
+    idf_sums: dict = {}
+    for token in query_tokens:
+        indexes = postings.get(token)
+        if not indexes:
+            continue
+        weight = _get_idf(token)
+        for index in indexes:
+            idf_sums[index] = idf_sums.get(index, 0.0) + weight
+    denominator = len(query_tokens) + 0.5
+    scores = {index: total / denominator for index, total in idf_sums.items()}
+    # 산 이름 직접 일치 시 강하게 부스팅
+    if mountain_name:
+        for mountain, indexes in by_mountain.items():
+            if mountain_name in mountain:
+                for index in indexes:
+                    scores[index] = scores.get(index, 0.0) + 1.5
+
+    # 동점이면 원래 코스 순서를 유지(이전 구현과 같은 결과)
+    ranked = sorted(
+        (index for index, score in scores.items() if score > 0),
+        key=lambda index: (-scores[index], index),
+    )
+    results = [(scores[index], courses[index]) for index in ranked[:top_k]]
     passages = []
     for _, course in results[:top_k]:
         diff = {"easy": "초급", "medium": "중급", "hard": "고급"}.get(course.get("difficulty", ""), "")

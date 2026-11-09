@@ -1,9 +1,40 @@
 from django.test import Client, TestCase
 
-from .local_road_api import fetch_local_road_trails, korea_2000_to_wgs84, load_local_road_trails
+from .local_road_api import (
+    decode_polyline,
+    encode_polyline,
+    fetch_local_road_trails,
+    has_road_route,
+    korea_2000_to_wgs84,
+    load_local_road_trails,
+    with_route_geometry,
+)
 
 
 class LocalRoadApiTests(TestCase):
+    def test_polyline_round_trip_keeps_meter_precision(self):
+        points = [
+            {"lat": 37.5665123, "lng": 126.9780456},
+            {"lat": 37.5601, "lng": 126.99},
+            {"lat": 33.1234567, "lng": 130.9999999},
+        ]
+
+        decoded = decode_polyline(encode_polyline(points))
+
+        self.assertEqual(len(decoded), len(points))
+        for original, restored in zip(points, decoded):
+            self.assertAlmostEqual(original["lat"], restored["lat"], delta=1e-5)
+            self.assertAlmostEqual(original["lng"], restored["lng"], delta=1e-5)
+
+    def test_cached_trails_are_stored_without_geometry_but_can_restore_it(self):
+        trail = load_local_road_trails()[0]
+
+        self.assertNotIn("route_geometry", trail)
+        self.assertTrue(has_road_route(trail))
+        restored = with_route_geometry(trail)
+        self.assertGreaterEqual(len(restored["route_geometry"]), 2)
+        self.assertNotIn("route_geometry", load_local_road_trails()[0])
+
     def test_korea_2000_to_wgs84_projects_expected_korea_bounds(self):
         point = korea_2000_to_wgs84(953901.0, 1952032.0)
 
